@@ -6,33 +6,89 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const API_URL = 'https://community-api.hero-wars.com/api/posts/published?page=1';
 
-// Headers to mimic a real browser
+// Headers
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
 };
 
 async function run() {
-  console.log("🤖 Universal Gift Scraper Activated...");
+  console.log("🤖 Universal Scraper (Repair Mode) Activated...");
 
   try {
-    // 2. Fetch Feed
     const response = await axios.get(API_URL, { headers: HEADERS });
     const posts = response.data.results || response.data || [];
 
+    console.log(`🔎 Feed fetched. Analyzing ${posts.length} posts...`);
+
     for (const post of posts) {
       const postId = post.id;
-      const rawBody = JSON.stringify(post);
+      // CLEANUP: We convert to string AND remove backslashes to fix broken links (https:\/\/ -> https://)
+      const rawBody = JSON.stringify(post).replace(/\\/g, ''); 
       const postUrl = `https://community.hero-wars.com/post/${postId}`;
 
-      // 3. Database Check (Prevent Duplicates)
-      const { data: existing } = await supabase.from('posts').select('id').eq('id', postId).single();
-      if (existing) { continue; }
+      // --- DB CHECK DISABLED FOR TESTING ---
+      // We want to force it to re-check posts to confirm the bit.ly logic works
+      // const { data: existing } = await supabase.from('posts').select('id').eq('id', postId).single();
+      // if (existing) { continue; } 
+      // -------------------------------------
 
-      console.log(`✨ Processing New Post: ${postId}`);
+      // 5. Link Discovery
+      // Matches: http or https, optional www, then the domain, then the rest of the link
+      const linkRegex = /https?:\/\/(?:www\.)?(herowars\.me|hero-wars\.com|bit\.ly|tinyurl\.com|goo\.gl)\/[a-zA-Z0-9\?\=\&\-\_]+/g;
+      
+      const foundLinks = rawBody.match(linkRegex);
 
-      // 4. Save Post to DB
-      await supabase.from('posts').insert({
+      if (foundLinks) {
+        // Remove duplicates found in the same post
+        const uniqueLinks = [...new Set(foundLinks)];
+        
+        console.log(`   ➡ Found potential links in post ${postId}: ${uniqueLinks.join(', ')}`);
+
+        let confirmedGifts = [];
+
+        for (const link of uniqueLinks) {
+          const result = await validateGiftLink(link);
+          
+          if (result.isValid) {
+            console.log(`   ✅ CONFIRMED GIFT: ${result.giftId}`);
+            
+            // Check if we already sent this SPECIFIC gift to DB (to avoid Discord spam on re-runs)
+            const { data: giftExists } = await supabase
+              .from('gifts')
+              .select('id')
+              .eq('gift_url', result.finalUrl)
+              .single();
+
+            if (!giftExists) {
+               await supabase.from('gifts').insert({ 
+                post_id: postId, 
+                gift_url: result.finalUrl, 
+                is_active: true 
+              });
+              confirmedGifts.push(result.finalUrl);
+            } else {
+              console.log(`      (Gift already in DB, skipping Discord alert)`);
+            }
+          }
+        }
+
+        // 6. Notification
+        if (confirmedGifts.length > 0) {
+          console.log("   🚀 Sending to Discord...");
+          const linksText = confirmedGifts.map(l => `[Click to Claim](${l})`).join('\n');
+          const embed = {
+            title: "🎁 New Gift Detected!",
+            description: `${linksText}\n\n[View Original Post](${postUrl})`,
+            color: 5763719,
+            footer: { text: "Hero Wars Data Hub" }
+          };
+          await sendDiscord(embed);
+        }
+      }
+      
+      // Upsert the post (Insert or Update if exists) to ensure we have the record
+      await supabase.from('posts').upsert({
         id: postId,
         title: post.title || 'No Title',
         body: rawBody,
@@ -40,51 +96,6 @@ async function run() {
         created_at: new Date(post.created_at * 1000 || Date.now()),
         url: postUrl
       });
-
-      // 5. Link Discovery (Expanded for bit.ly)
-      // Matches: herowars.me, hero-wars.com, bit.ly, tinyurl.com, goo.gl
-      const linkRegex = /https?:\/\/(?:www\.)?(herowars\.me|hero-wars\.com|bit\.ly|tinyurl\.com|goo\.gl)\/[a-zA-Z0-9\?\=\&\-\_]+/g;
-      const foundLinks = rawBody.match(linkRegex);
-
-      if (foundLinks) {
-        let confirmedGifts = [];
-
-        for (const link of foundLinks) {
-          // Remove trailing quotes/escaped chars if JSON.stringify added them
-          const cleanLink = link.replace(/\\/g, ''); 
-          
-          const result = await validateGiftLink(cleanLink);
-          
-          if (result.isValid) {
-            console.log(`✅ GIFT CONFIRMED: ${result.giftId}`);
-            
-            // Save Gift to DB
-            await supabase.from('gifts').insert({ 
-              post_id: postId, 
-              gift_url: result.finalUrl, 
-              is_active: true 
-            });
-            
-            confirmedGifts.push(result.finalUrl);
-          }
-        }
-
-        // 6. Notification
-        if (confirmedGifts.length > 0) {
-          // Create a unique list (remove duplicates)
-          const uniqueLinks = [...new Set(confirmedGifts)];
-          const linksText = uniqueLinks.map(l => `[Click to Claim](${l})`).join('\n');
-          
-          const embed = {
-            title: "🎁 New Gift Detected!",
-            description: `${linksText}\n\n[View Original Post](${postUrl})`,
-            color: 5763719, // Green
-            footer: { text: "Hero Wars Data Hub" }
-          };
-
-          await sendDiscord(embed);
-        }
-      }
     }
 
   } catch (error) {
@@ -92,29 +103,26 @@ async function run() {
   }
 }
 
-// 🕵️‍♂️ Validates if the link (or its redirect) has 'gift_id'
 async function validateGiftLink(url) {
   try {
-    console.log(`🔎 Checking: ${url}`);
+    // console.log(`      Testing: ${url}`); // Uncomment for deep debug
     const response = await axios.get(url, { 
       headers: HEADERS,
-      maxRedirects: 5, // Follows bit.ly -> herowars automatically
+      maxRedirects: 5, 
       validateStatus: status => status < 400 
     });
 
     const finalUrl = response.request.res.responseUrl || url;
     
-    // THE CHECK: Does the final destination have "gift_id=" ?
     if (finalUrl.includes('gift_id=')) {
       const idMatch = finalUrl.match(/gift_id=([a-zA-Z0-9]+)/);
       const giftId = idMatch ? idMatch[1] : 'Unknown';
       return { isValid: true, finalUrl: finalUrl, giftId: giftId };
     }
-
     return { isValid: false };
 
   } catch (e) {
-    console.log(`Link check failed for ${url}: ${e.message}`);
+    // console.log(`      Link failed: ${e.message}`);
     return { isValid: false };
   }
 }
