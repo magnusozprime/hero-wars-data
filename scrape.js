@@ -1,47 +1,29 @@
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// 1. Setup Connections
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const API_URL = 'https://community-api.hero-wars.com/api/posts/published?page=1';
 
-// Headers to mimic a real Chrome Browser (Prevents blocking)
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
 };
 
 async function run() {
-  console.log("🤖 Hero Wars Scraper: ONLINE");
+  console.log("🤖 Hero Wars Scraper: ALWAYS SCAN MODE");
 
   try {
-    // 2. Fetch Feed
     const response = await axios.get(API_URL, { headers: HEADERS });
-    // Handle different data structures safely
-    const posts = response.data.results || response.data.data || response.data || [];
-
-    console.log(`🔎 Scanning ${posts.length} posts...`);
+    const posts = response.data.results || response.data || [];
 
     for (const post of posts) {
       const postId = post.id;
-      // Clean up the data (Fix broken slashes in links)
       const rawBody = JSON.stringify(post).replace(/\\/g, ''); 
       const postUrl = `https://community.hero-wars.com/post/${postId}`;
 
-      // 3. Database Check (Prevent Duplicates)
-      const { data: existing } = await supabase.from('posts').select('id').eq('id', postId).single();
-      
-      if (existing) {
-        // Post is already in DB. Skip it to prevent spam.
-        // (Since you deleted your DB, this will return false, and the code will run!)
-        continue; 
-      }
-
-      console.log(`✨ New Post Found: ${postId}`);
-
-      // 4. Save Post to DB
-      await supabase.from('posts').insert({
+      // 1. Ensure Post is in DB (Upsert = Insert or Update)
+      await supabase.from('posts').upsert({
         id: postId,
         title: post.title || 'No Title',
         body: rawBody,
@@ -50,24 +32,21 @@ async function run() {
         url: postUrl
       });
 
-      // 5. Link Discovery
-      // Finds: herowars.me, hero-wars.com, bit.ly, tinyurl, goo.gl
+      // 2. Scan for Links (WE DO NOT SKIP THE POST ANYMORE)
       const linkRegex = /https?:\/\/(?:www\.)?(herowars\.me|hero-wars\.com|bit\.ly|tinyurl\.com|goo\.gl)\/[a-zA-Z0-9\?\=\&\-\_]+/g;
       const foundLinks = rawBody.match(linkRegex);
 
       if (foundLinks) {
-        // Remove duplicates within the same post
         const uniqueLinks = [...new Set(foundLinks)];
-        let confirmedGifts = [];
+        let newGiftsFound = [];
 
         for (const link of uniqueLinks) {
-          // Validate the link (Check if it redirects to a Gift ID)
+          // 3. Validate Link
           const result = await validateGiftLink(link);
           
           if (result.isValid) {
-            console.log(`✅ GIFT CONFIRMED: ${result.giftId}`);
-            
-            // Double check: Have we posted this specific gift link before?
+            // 4. Check if this specific GIFT URL is already in DB
+            // We check the 'gift_url' column to see if we have processed this specific reward before
             const { data: giftExists } = await supabase
               .from('gifts')
               .select('id')
@@ -75,24 +54,34 @@ async function run() {
               .single();
 
             if (!giftExists) {
+              console.log(`✅ NEW GIFT FOUND: ${result.giftId}`);
+              
+              // Insert into DB
               await supabase.from('gifts').insert({ 
                 post_id: postId, 
                 gift_url: result.finalUrl, 
                 is_active: true 
               });
-              confirmedGifts.push(result.finalUrl);
+
+              // Add to list for Discord
+              newGiftsFound.push(result.finalUrl);
+            } else {
+              // We already have this gift, so we stay silent
+              console.log(`   (Gift ${result.giftId} already in DB)`);
             }
           }
         }
 
-        // 6. Send Discord Notification
-        if (confirmedGifts.length > 0) {
-          const linksText = confirmedGifts.map(l => `[Click To Claim Gift](${l})`).join('\n');
+        // 5. Send Discord (Only if we found NEW gifts)
+        if (newGiftsFound.length > 0) {
+          console.log("🚀 Sending to Discord...");
+          
+          const linksText = newGiftsFound.map(l => `[👉 Click Here to Claim Gift](${l})`).join('\n');
           
           const embed = {
             title: "🎁 New Gift Detected!",
-            description: `${linksText}\n\n[View Original Post](${postUrl})`,
-            color: 5763719, // Green
+            description: `${linksText}\n\n[Source Post](${postUrl})`,
+            color: 5763719,
             footer: { text: "Hero Wars Data Hub" },
             timestamp: new Date().toISOString()
           };
@@ -107,7 +96,6 @@ async function run() {
   }
 }
 
-// 🕵️‍♂️ Validator: Follows redirects (bit.ly) and checks for 'gift_id'
 async function validateGiftLink(url) {
   try {
     const response = await axios.get(url, { 
@@ -118,7 +106,7 @@ async function validateGiftLink(url) {
 
     const finalUrl = response.request.res.responseUrl || url;
     
-    // THE CHECK: Does it have "gift_id=" ?
+    // STRICT VALIDATION: Must have 'gift_id='
     if (finalUrl.includes('gift_id=')) {
       const idMatch = finalUrl.match(/gift_id=([a-zA-Z0-9]+)/);
       const giftId = idMatch ? idMatch[1] : 'Unknown';
@@ -133,9 +121,19 @@ async function validateGiftLink(url) {
 }
 
 async function sendDiscord(embed) {
-  if (!DISCORD_WEBHOOK) return;
-  try { await axios.post(DISCORD_WEBHOOK, { embeds: [embed] }); } 
-  catch (e) { console.error("Discord Error"); }
+  if (!DISCORD_WEBHOOK) {
+    console.log("❌ No Discord Webhook URL provided.");
+    return;
+  }
+  try { 
+    await axios.post(DISCORD_WEBHOOK, { embeds: [embed] }); 
+    console.log("✅ Discord Message Sent.");
+  } 
+  catch (e) { 
+    console.error("❌ Discord Failed:", e.message); 
+    // Fallback: Try sending plain text if embed fails
+    try { await axios.post(DISCORD_WEBHOOK, { content: `🎁 **New Gift!**\n${embed.description}` }); } catch (z) {}
+  }
 }
 
 run();
