@@ -13,7 +13,7 @@ const HEADERS = {
 };
 
 async function run() {
-  console.log("🤖 Gift-Only Scraper Activated...");
+  console.log("🤖 Scraper v4 (ID Validator) Activated...");
 
   try {
     // 2. Fetch Feed
@@ -22,29 +22,30 @@ async function run() {
 
     for (const post of posts) {
       const postId = post.id;
+      const title = post.title || 'No Title';
       const rawBody = JSON.stringify(post);
       const postUrl = `https://community.hero-wars.com/post/${postId}`;
 
       // 3. Database Check (Prevent Duplicates)
       const { data: existing } = await supabase.from('posts').select('id').eq('id', postId).single();
       if (existing) {
-        // Post already handled. Skip.
+        // We stop here because we assume older posts are already processed
+        // Remove 'continue' if you want to re-check old posts for missed gifts
         continue; 
       }
 
-      console.log(`✨ Processing New Post: ${postId}`);
-
-      // 4. Save Post to DB (So we don't check it again next time)
+      // 4. Save Post to DB
       await supabase.from('posts').insert({
         id: postId,
-        title: post.title || 'No Title',
+        title: title,
         body: rawBody,
         image_url: post.image_url || null,
         created_at: new Date(post.created_at * 1000 || Date.now()),
         url: postUrl
       });
 
-      // 5. Link Discovery (Only herowars.me and hero-wars.com)
+      // 5. Link Discovery
+      // We look for herowars.me shortlinks AND direct hero-wars.com links
       const linkRegex = /(https:\/\/herowars\.me\/[a-zA-Z0-9]+)|(https:\/\/www\.hero-wars\.com\/\?[\w=&]+)/g;
       const foundLinks = rawBody.match(linkRegex);
 
@@ -52,38 +53,33 @@ async function run() {
         let confirmedGifts = [];
 
         for (const link of foundLinks) {
+          console.log(`🔎 Checking link: ${link}`);
           const result = await validateGiftLink(link);
           
           if (result.isValid) {
-            console.log(`✅ GIFT CONFIRMED: ${result.giftId}`);
+            console.log(`✅ CONFIRMED GIFT ID: ${result.giftId}`);
             
-            // Save Gift to DB
+            // Save to DB
             await supabase.from('gifts').insert({ 
               post_id: postId, 
-              gift_url: result.finalUrl, 
+              gift_url: result.finalUrl, // Store the long URL with the ID
               is_active: true 
             });
             
             confirmedGifts.push(result.finalUrl);
+          } else {
+            console.log(`❌ Not a gift link.`);
           }
         }
 
-        // 6. Notification - ONLY if gifts were found
+        // 6. Notification
         if (confirmedGifts.length > 0) {
-          // Format links nicely for Discord
-          const linksText = confirmedGifts.map(l => `[Click to Claim](${l})`).join('\n');
-          
-          const embed = {
-            title: "🎁 New Gift Detected!",
-            description: `${linksText}\n\n[View Original Post](${postUrl})`,
-            color: 5763719, // Green color
-            footer: { text: "Hero Wars Data Hub" }
-          };
-
-          await sendDiscord(embed);
+          const linksText = confirmedGifts.map(l => `<${l}>`).join('\n'); // <> prevents discord embed clutter
+          await sendDiscord(`🎁 **NEW GIFT FOUND!**\n${linksText}\n\nSource: ${postUrl}`);
         }
+      } else {
+        await sendDiscord(`📰 **News:** ${title}\n${postUrl}`);
       }
-      // NO 'ELSE' BLOCK HERE. If no gift, we stay silent.
     }
 
   } catch (error) {
@@ -91,20 +87,24 @@ async function run() {
   }
 }
 
-// 🕵️‍♂️ Validates if the link has 'gift_id'
+// 🕵️‍♂️ The "Gift ID" Validator
 async function validateGiftLink(url) {
   try {
+    // Follow the redirects to see the final URL
     const response = await axios.get(url, { 
       headers: HEADERS,
       maxRedirects: 5,
       validateStatus: status => status < 400 
     });
 
-    const finalUrl = response.request.res.responseUrl || url;
+    const finalUrl = response.request.res.responseUrl || url; // The destination URL
     
+    // THE CHECK: Does it have "gift_id=" ?
     if (finalUrl.includes('gift_id=')) {
+      // Extract the ID just for logging
       const idMatch = finalUrl.match(/gift_id=([a-zA-Z0-9]+)/);
       const giftId = idMatch ? idMatch[1] : 'Unknown';
+      
       return { isValid: true, finalUrl: finalUrl, giftId: giftId };
     }
 
@@ -116,12 +116,9 @@ async function validateGiftLink(url) {
   }
 }
 
-async function sendDiscord(embed) {
+async function sendDiscord(text) {
   if (!DISCORD_WEBHOOK) return;
-  try { 
-    // Sending as an Embed for a professional look
-    await axios.post(DISCORD_WEBHOOK, { embeds: [embed] }); 
-  } 
+  try { await axios.post(DISCORD_WEBHOOK, { content: text }); } 
   catch (e) { console.error("Discord Error"); }
 }
 
